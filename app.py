@@ -1,147 +1,100 @@
 
-from pathlib import Path
-
-import cv2
-import matplotlib.pyplot as plt
-import numpy as np
 import streamlit as st
 import torch
-import torchvision.transforms as T
-from PIL import Image
-from pytorch_grad_cam import GradCAM
-from pytorch_grad_cam.utils.image import show_cam_on_image
+import torch.nn as nn
+import torchvision.transforms as transforms
 from torchvision import models
+from PIL import Image
+import numpy as np
+import cv2
 
 
-MODEL_PATH = Path(__file__).with_name("resnet18_fever_detector.pth") 
-TARGET_SIZE = (224, 224)
-ROI_CFG = {  
-    "head": (0.00, 0.20),  
-    "udder": (0.70, 1.00),  
-}
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+class FeverResNet18(nn.Module):
+    def __init__(self, num_classes=2):
+        super(FeverResNet18, self).__init__()
+        self.model = models.resnet18(pretrained=False)
+        self.model.fc = nn.Linear(self.model.fc.in_features, num_classes)
+
+    def forward(self, x):
+        return self.model(x)
 
 
-@st.cache_resource(show_spinner=False)
-def load_model(path: Path):
-    """Load fine‑tuned ResNet‑18."""
-    model = models.resnet18(weights=None)
-    model.fc = torch.nn.Sequential(
-        torch.nn.Dropout(0.25), torch.nn.Linear(model.fc.in_features, 1)
-    )
-    model.load_state_dict(torch.load(path, map_location="cpu"))
-    model.eval().to(DEVICE)
+@st.cache_resource
+def load_model():
+    model = FeverResNet18()
+    model.load_state_dict(torch.load("resnet18_fever_detector.pth", map_location=torch.device('cpu')))
+    model.eval()
     return model
 
+model = load_model()
 
-def load_resize(fp, size=TARGET_SIZE):
-    img = Image.open(fp).convert("RGB")
-    return np.array(img.resize(size, resample=Image.BILINEAR))
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
 
-
-def thermal_to_mask(img_rgb: np.ndarray):
-    """Very fast silhouette estimator on FLIR colormapped frames."""
-    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-    gray = hsv[..., 2]  
-    gray = cv2.GaussianBlur(gray, (9, 9), 0)
-    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return np.zeros_like(mask)
-    big = max(cnts, key=cv2.contourArea)
-    clean = np.zeros_like(mask)
-    cv2.drawContours(clean, [big], -1, 255, -1)
-    clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=3)
-    return clean  
-
-def overlay_roi(img_rgb: np.ndarray, mask: np.ndarray, roi_cfg: dict = ROI_CFG):
-    """Return copy with ROI rectangles drawn."""
-    out = img_rgb.copy()
-    h, w = mask.shape
-    for name, (y0, y1) in roi_cfg.items():
-        p0, p1 = (0, int(y0 * h)), (w, int(y1 * h))
-        color = (0, 255, 0) if name == "head" else (255, 0, 0)
-        cv2.rectangle(out, p0, p1, color, 2)
-        cv2.putText(out, name.upper(), (p0[0] + 5, p0[1] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-    return out
-
-
-def predict(img_rgb: np.ndarray, model):
-    tfm = T.Compose([
-        T.ToTensor(),
-        T.Resize(TARGET_SIZE),
-        T.Normalize([0.5] * 3, [0.5] * 3),
-    ])
-    x = tfm(Image.fromarray(img_rgb)).unsqueeze(0).to(DEVICE)
+def predict(image, model):
+    image = transform(image).unsqueeze(0)
     with torch.no_grad():
-        logit = model(x)
-        prob = torch.sigmoid(logit).item()
-    return prob  
+        outputs = model(image)
+        probs = torch.softmax(outputs, dim=1)
+        return probs[0][1].item()  # probability of class 1 (fever)
 
 
-def grad_cam_vis(img_rgb: np.ndarray, model):
-    tfm = T.Compose([T.ToTensor(), T.Resize(TARGET_SIZE)])
-    tensor = tfm(Image.fromarray(img_rgb)).unsqueeze(0).to(DEVICE)
-    
-    cam = GradCAM(model=model, target_layers=[model.layer4[-1]], use_cuda=torch.cuda.is_available())
-    mask = cam(tensor)[0]
-    vis = show_cam_on_image(img_rgb / 255.0, mask, use_rgb=True)
-    return vis
+def generate_grad_cam(input_image, model):
+    model.eval()
+    image_tensor = transform(input_image).unsqueeze(0).requires_grad_()
+    output = model(image_tensor)
 
+    target_class = output.argmax().item()
+    output[0, target_class].backward()
 
-st.set_page_config("Holstein Fever Early‑Warning Demo", layout="centered")
-st.title("🐄 Holstein Cattle – Thermal Early Disease Demo")
+    gradients = model.model.layer4[1].conv2.weight.grad
+    activations = model.model.layer4[1].conv2.weight
 
-st.markdown(
-    "Upload a **thermal JPEG** from the *Holstein Cattle Recognition* dataset (or one with similar FLIR colormap).\n"
-    "The app will: 1️⃣ segment the cow, 2️⃣ draw ROI boxes, 3️⃣ run the CNN fever detector,"
-    " 4️⃣ display Grad‑CAM heatmap explaining the decision."
-)
+    pooled_gradients = torch.mean(gradients, dim=[0, 2, 3])
+    for i in range(activations.shape[1]):
+        activations[0, i, :, :] *= pooled_gradients[i]
 
-uploaded = st.file_uploader("Choose thermal image …", type=["jpg", "jpeg", "png"])
+    heatmap = torch.mean(activations, dim=1).squeeze()
+    heatmap = np.maximum(heatmap.detach().numpy(), 0)
+    heatmap = cv2.resize(heatmap, (224, 224))
+    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min())
+    return heatmap
 
+st.title("🐄 AI-Powered Fever Detection in Livestock (Demo)")
+st.write("Upload a thermal image of a cow to detect fever signs using ResNet18 + Grad-CAM")
 
-if MODEL_PATH.exists():
-    model = load_model(MODEL_PATH)
-else:
-    st.warning("`model.pth` not found – predictions disabled.")
-    model = None
+uploaded_file = st.file_uploader("Choose a thermal image", type=["jpg", "jpeg", "png"])
 
-if uploaded is not None:
-   
-    img_rgb = load_resize(uploaded)
-    mask = thermal_to_mask(img_rgb)
-    overlay = overlay_roi(img_rgb, mask)
+if uploaded_file:
+    image = Image.open(uploaded_file).convert('RGB')
+    st.image(image, caption="Uploaded Image", use_column_width=True)
 
    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Thermal + ROI")
-        st.image(overlay, clamp=True, channels="RGB")
-    with col2:
-        st.subheader("Silhouette mask")
-        st.image(mask, clamp=True)
+    prob = predict(image, model)
+    fever = prob > 0.5
+    st.subheader("Prediction Result")
+    st.write(f"**Fever Probability:** {prob:.2f}")
+    if fever:
+        st.error("🚨 Fever likely!")
+    else:
+        st.success("✅ Normal")
 
-    if model is not None:
-        prob = predict(img_rgb, model)
-        fever = prob > 0.5
-        st.success(f"**Fever probability:** {prob:.2%} → {'🚨 Likely' if fever else '✅ Normal'}")
-
-        # Grad‑CAM
-        with st.spinner("Computing Grad‑CAM …"):
-            vis = grad_cam_vis(img_rgb, model)
-        st.subheader("Model attention (Grad‑CAM)")
-        st.image(vis, clamp=True, channels="RGB")
     
-    st.caption("Note: This is a *demo* using an uncalibrated brightness proxy, not absolute temperature.")
-else:
-    st.info("Upload an image to get started.")
-
+    st.subheader("Grad-CAM Explanation")
+    cam = generate_grad_cam(image, model)
+    img_np = np.array(image.resize((224, 224)))
+    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+    heatmap = np.float32(heatmap) / 255
+    overlay = heatmap + np.float32(img_np) / 255
+    overlay = overlay / np.max(overlay)
+    st.image(np.uint8(255 * overlay), caption="Grad-CAM", use_column_width=True)
 
 st.sidebar.header("About this demo")
-st.sidebar.markdown(
-    "* **Dataset**: [Holstein Cattle Recognition](https://doi.org/10.34894/O1ZBSA) – University of Groningen.\n"
-    "* **Model**: ResNet‑18 fine‑tuned to classify *fever* vs *normal* based on ROI brightness proxy.\n"
-    "* **Paper idea**: Early detection of mastitis / fever using thermal cameras in barns."
-)
+st.sidebar.markdown("""
+* **Model:** ResNet18 fine-tuned to classify *fever* vs *normal*.
+* **Dataset:** Holstein Cattle (thermal images)
+* **Demo Goal:** Show explainable AI (Grad-CAM) + CV for livestock fever detection.
+""")
 
